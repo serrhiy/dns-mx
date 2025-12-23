@@ -2,11 +2,10 @@
 #include <vector>
 #include <future>
 #include <map>
+#include <functional>
 
 #include <ares.h>
 #include <boost/asio.hpp>
-
-#include "defer.hh"
 
 struct MxRecord {
   std::string hostname;
@@ -17,6 +16,8 @@ constexpr int DEFAULT_TIMEOUT = 2000;
 
 class MxResolver {
   using wait_type = boost::asio::posix::descriptor_base::wait_type;
+  using result_t = std::vector<MxRecord>;
+  using callback_t = std::function<void(std::exception_ptr, result_t)>;
 
   ares_channel_t* channel;
   boost::asio::any_io_executor executor;
@@ -26,15 +27,19 @@ class MxResolver {
   static void socketStateCallback(void *data, ares_socket_t fd, int readable, int writable) {
     MxResolver* resolver = reinterpret_cast<MxResolver*>(data);
     auto callback = std::bind(&MxResolver::onSocketEvent, resolver, fd, readable != 0, writable != 0);
-    boost::asio::post(resolver->executor, std::move(callback));
+    boost::asio::dispatch(resolver->executor, std::move(callback));
   }
 
   void updateTimer() {
     using namespace boost::asio::chrono;
 
+    timeout_timer.cancel();
+    if (fds.empty()) {
+      return;
+    }
+
     struct timeval tv;
     ares_timeout(channel, nullptr, &tv);
-    timeout_timer.cancel();
     timeout_timer.expires_after(seconds{ tv.tv_sec } + microseconds{ tv.tv_usec });
     timeout_timer.async_wait([this](const boost::system::error_code& err) {
       if (!err) {
@@ -67,9 +72,9 @@ class MxResolver {
       return;
     }
 
+    auto& descriptor = fds.try_emplace(fd, executor, fd).first->second;
     updateTimer();
 
-    auto& descriptor = fds.try_emplace(fd, executor, fd).first->second;
     if (readable) {
       descriptor.async_wait(wait_type::wait_read, [this, fd](const boost::system::error_code& err) {
         asyncSocketEvent(err, fd, wait_type::wait_read);
@@ -86,15 +91,14 @@ class MxResolver {
   }
 
   static void processResponse(void* arg, ares_status_t status, size_t timeouts, const ares_dns_record_t* dnsrec) {
-    auto promise = reinterpret_cast<std::promise<std::vector<MxRecord>>*>(arg);
-    utils::defer defer{ [promise](){ delete promise; } };
+    std::unique_ptr<callback_t> callback{ reinterpret_cast<callback_t*>(arg) };
     if (status == ARES_ENODATA || status == ARES_ENOTFOUND) {
-      promise->set_value({});
+      callback->operator()(nullptr, {});
       return;
     }
     if (status != ARES_SUCCESS) {
       auto exception = std::make_exception_ptr(std::runtime_error(ares_strerror(status)));
-      promise->set_exception(exception);
+      callback->operator()(exception, {});
       return;
     }
     const size_t count = ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_ANSWER);
@@ -109,7 +113,7 @@ class MxResolver {
         records.push_back(MxRecord{mx, preference});
       }
     }
-    promise->set_value(std::move(records));
+    callback->operator()(nullptr, std::move(records));
   }
 
   public:
@@ -130,10 +134,21 @@ class MxResolver {
   MxResolver(MxResolver&&) = delete;
   MxResolver& operator=(MxResolver&&) = delete;
 
-  std::future<std::vector<MxRecord>> request(std::string_view domain) {
-    auto promise = new std::promise<std::vector<MxRecord>>;
+  void request(std::string_view domain, callback_t callback) {
+    auto fn = new callback_t{ std::move(callback) };
+    ares_query_dnsrec(channel, domain.data(), ARES_CLASS_IN, ARES_REC_TYPE_MX, processResponse, fn, nullptr);
+  }
+
+  std::future<result_t> request(std::string_view domain) {
+    auto promise = std::make_shared<std::promise<result_t>>();
     auto future = promise->get_future();
-    ares_query_dnsrec(channel, domain.data(), ARES_CLASS_IN, ARES_REC_TYPE_MX, processResponse, promise, nullptr);
+    request(domain, [promise](std::exception_ptr exception, result_t result) {
+      if (exception) {
+        promise->set_exception(exception);
+        return;
+      }
+      promise->set_value(std::move(result));
+    });
     return future;
   }
 
@@ -145,6 +160,7 @@ class MxResolver {
 int main(const int argc, const char* argv[]) {
   boost::asio::io_context io_context;
   MxResolver resolver{ io_context.get_executor() };
+  
   const std::vector<std::string> domains{ "gmail.com", "jci.com", "outlook.com" };
   std::vector<std::future<std::vector<MxRecord>>> futures;
   for (const std::string& domain: domains) {
